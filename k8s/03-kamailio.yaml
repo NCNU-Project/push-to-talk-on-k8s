@@ -1,7 +1,6 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  creationTimestamp: null
   name: kamailio-pods
 ---
 # which generate it with following cmd
@@ -10,7 +9,6 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  creationTimestamp: null
   name: kamailio-service-viewer
   namespace: default
 rules:
@@ -31,7 +29,6 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  creationTimestamp: null
   name: kamailio-service-rolebinding
   namespace: default
 roleRef:
@@ -68,7 +65,7 @@ metadata:
   labels:
     app: kamailio
 spec:
-  type: LoadBalancer
+  clusterIP: None
   selector:
     app: kamailio
   ports:
@@ -85,7 +82,7 @@ metadata:
   labels:
     app: kamailio
 spec:
-  replicas: 4
+  replicas: 1
   selector:
     matchLabels:
       app: kamailio
@@ -98,15 +95,42 @@ spec:
     spec:
       serviceAccountName: kamailio-pods
       volumes:
-        - name: rtpengine-config
+        - name: kamailio-environment-config
           emptyDir: {}
         - name: kamailio-config
           configMap:
             name: kamailio-config
       initContainers:
-        - name: init-rtpengine-config
+        - name: fetch-ingress-ip
+          image: stedolan/jq
+          command: ["/bin/bash"]
+          args:
+            - '-c'
+            - |
+              TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token);
+              NS=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace);
+              CA_CRT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+              # LOADBALANCER_IP=$(curl -H "Authorization: Bearer $TOKEN" --cacert $CA_CRT https://kubernetes/api/v1/namespaces/$NS/services/kamailio | jq -r .status.loadBalancer.ingress[0].ip);
+              LOADBALANCER_IP=$(wget -O- --header "Authorization: Bearer $TOKEN" --ca-certificate $CA_CRT https://kubernetes/api/v1/namespaces/$NS/services/kamailio | jq -r .status.loadBalancer.ingress[0].ip);
+              printf '#!define SIP_LB_IP %s \n' $LOADBALANCER_IP >> /data/kamailio/local.k;
+          volumeMounts:
+            - name: kamailio-environment-config
+              mountPath: /data/kamailio
+
+        - name: init-kamailio-config
           image: tutum/dnsutils
           env:
+            # following is the kamailio's environment
+            - name: LOCAL_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: SIP_LB_DOMAIN
+              value: kamailio.test.hellostrong.org
+            - name: WEBRTC_ING_DOMAIN
+              value: webrtc.test.hellostrong.org
+
+            # following is RTPEngine's environment
             - name: DB_SVC_NAME
               valueFrom:
                 configMapKeyRef:
@@ -148,23 +172,31 @@ spec:
               # get ordinal number from hostname
               [[ `hostname` =~ -([0-9]+)$ ]] || exit 1;
               ordinal=${BASH_REMATCH[1]};
-              printf 'server_id=%s\n' $ordinal >> /data/rtpengine/server_id.k;
-              printf '#!trydef DBURL "%s"\n' $DBURL >> /data/rtpengine/db_url.k;
-              printf '#!trydef RODBURL "%s"\n' $DBROURL >> /data/rtpengine/db_url.k;
-              printf '#!trydef CONTACT_DB "contacts_db=>%s"\n' $DBROURL >> /data/rtpengine/db_url;
+              # following command generate the rtpengine's config
+              printf 'server_id=%s\n' $ordinal >> /data/kamailio/local.k;
+              printf '#!trydef DBURL "%s"\n' $DBURL >> /data/kamailio/local.k;
+              printf '#!trydef RODBURL "%s"\n' $DBROURL >> /data/kamailio/local.k;
+              printf '#!trydef CONTACT_DB "contacts_db=>%s"\n' $DBROURL >> /data/kamailio/local.k;
+              # following command generate the kamailio's config
+              printf 'alias=%s\n' $SIP_LB_DOMAIN  >> /data/kamailio/local.k;
+              printf 'alias=%s\n' $WEBRTC_ING_DOMAIN  >> /data/kamailio/local.k;
+              printf 'listen=udp:%s:5060 advertise SIP_LB_IP\n' $LOCAL_IP >> /data/kamailio/local.k;
+              printf '#!substdef "!MY_IP4_ADDR!%s!g"\n' $LOCAL_IP >> /data/kamailio/local.k;
+
           volumeMounts:
-            - name: rtpengine-config
-              mountPath: /data/rtpengine
+            - name: kamailio-environment-config
+              mountPath: /data/kamailio
+
       containers:
       - name: kamailio
         # image: efficacy38/kamailio:v1.13
-        image: efficacy38/kamailio:v1.16
+        image: localhost:32000/kamailio
         imagePullPolicy: Always
         # command: ["sleep", "infinity"]
         ports:
         - containerPort: 5060
         volumeMounts:
-          - name: rtpengine-config
-            mountPath: /data/rtpengine
+          - name: kamailio-environment-config
+            mountPath: /data/kamailio
           - name: kamailio-config
             mountPath: /etc/kamailio
